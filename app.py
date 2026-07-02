@@ -1,442 +1,234 @@
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Spool — downloader de áudio</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #14161a;
-    --panel: #1c1f26;
-    --panel-2: #22262e;
-    --line: #2d323c;
-    --text: #ece9e2;
-    --muted: #8b909c;
-    --accent: #6ee7b0;
-    --amber: #f2b750;
-    --red: #ff6b6b;
-  }
+import os
+import re
+import uuid
+import zipfile
+import subprocess
+import threading
+from pathlib import Path
 
-  * { box-sizing: border-box; }
+from flask import Flask, request, jsonify, send_file, render_template, abort
 
-  body {
-    margin: 0;
-    background: var(--bg);
-    background-image:
-      radial-gradient(circle at 15% 0%, rgba(110,231,176,0.06), transparent 40%),
-      radial-gradient(circle at 85% 100%, rgba(242,183,80,0.05), transparent 40%);
-    color: var(--text);
-    font-family: 'Inter', system-ui, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    justify-content: center;
-    padding: 48px 20px 80px;
-  }
+app = Flask(__name__)
 
-  .wrap { width: 100%; max-width: 620px; }
+BASE_DIR = Path("/tmp/scdl_jobs")
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-  .eyebrow {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    letter-spacing: 0.18em;
-    color: var(--muted);
-    text-transform: uppercase;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 10px;
-  }
+JOBS = {}
+JOBS_LOCK = threading.Lock()
 
-  .eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+# Captura linhas como: ERROR: [soundcloud] 2300024921: This video is DRM protected
+REGEX_ERRO = re.compile(r'^ERROR:\s*(?:\[(?P<site>[\w:]+)\]\s*(?P<id>[^:]+):\s*)?(?P<msg>.+)$')
 
-  h1 {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 30px;
-    font-weight: 700;
-    margin: 0 0 6px;
-    letter-spacing: -0.01em;
-  }
 
-  .sub { color: var(--muted); font-size: 14.5px; margin-bottom: 28px; line-height: 1.5; }
+def obter_mapa_titulos(url):
+    """Busca leve (sem resolver formatos) para traduzir id -> título.
+    Funciona mesmo para faixas com DRM, já que não checa disponibilidade."""
+    mapa = {}
+    try:
+        comando = [
+            "yt-dlp", "--flat-playlist", "--skip-download", "--no-warnings",
+            "--ignore-errors", "--print", "%(id)s\t%(title)s", url,
+        ]
+        resultado = subprocess.run(
+            comando, capture_output=True, text=True,
+            encoding="utf-8", errors="ignore", timeout=60,
+        )
+        for linha in resultado.stdout.splitlines():
+            linha = linha.strip()
+            if "\t" in linha:
+                id_faixa, titulo = linha.split("\t", 1)
+                if id_faixa and titulo:
+                    mapa[id_faixa.strip()] = titulo.strip()
+    except Exception:
+        pass
+    return mapa
 
-  .meter {
-    display: flex;
-    align-items: flex-end;
-    gap: 3px;
-    height: 22px;
-    margin-bottom: 22px;
-  }
-  .meter span {
-    width: 4px;
-    background: var(--line);
-    border-radius: 1px;
-    height: 20%;
-    transition: background 0.2s;
-  }
-  .meter.ativo span {
-    background: var(--accent);
-    animation: bounce 0.9s ease-in-out infinite;
-  }
-  .meter.ativo span:nth-child(odd) { animation-duration: 0.7s; }
-  .meter.ativo span:nth-child(3n) { animation-duration: 1.1s; }
-  @keyframes bounce {
-    0%, 100% { height: 15%; }
-    50% { height: 90%; }
-  }
 
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 22px;
-  }
+def atualizar_job(job_id, **kwargs):
+    with JOBS_LOCK:
+        JOBS[job_id].update(kwargs)
 
-  label {
-    display: block;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin-bottom: 8px;
-  }
 
-  input[type=text] {
-    width: 100%;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    color: var(--text);
-    font-size: 14.5px;
-    padding: 13px 14px;
-    font-family: 'Inter', sans-serif;
-  }
-  input[type=text]:focus { outline: none; border-color: var(--accent); }
-  input[type=text]::placeholder { color: #565b66; }
+def upsert_item(job_id, nome, tipo, motivo=None):
+    """Adiciona ou atualiza uma linha na lista de status do job."""
+    with JOBS_LOCK:
+        job = JOBS[job_id]
+        item = {"nome": nome, "tipo": tipo, "motivo": motivo}
+        idx = job["indice"].get(nome)
+        if idx is not None:
+            job["itens"][idx] = item
+        else:
+            job["itens"].append(item)
+            job["indice"][nome] = len(job["itens"]) - 1
 
-  .row { display: flex; gap: 12px; margin-top: 18px; }
-  .col { flex: 1; }
 
-  .segmented {
-    display: flex;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    overflow: hidden;
-  }
-  .segmented button {
-    flex: 1;
-    background: transparent;
-    border: none;
-    color: var(--muted);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12.5px;
-    padding: 11px 0;
-    cursor: pointer;
-    transition: 0.15s;
-  }
-  .segmented button.ativo { background: var(--accent); color: #0d1410; font-weight: 700; }
+def processar_download(job_id, url, formato, bitrate):
+    pasta = BASE_DIR / job_id
+    pasta.mkdir(parents=True, exist_ok=True)
 
-  select {
-    width: 100%;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 13px;
-    padding: 11px 12px;
-  }
-  select:disabled { opacity: 0.4; }
+    atualizar_job(job_id, resumo="Buscando lista de músicas...", cor="info")
+    mapa_titulos = obter_mapa_titulos(url)
+    atualizar_job(job_id, resumo="Baixando...", cor="info")
 
-  .btn-baixar {
-    width: 100%;
-    margin-top: 22px;
-    background: var(--accent);
-    color: #0d1410;
-    border: none;
-    border-radius: 6px;
-    padding: 15px 0;
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 700;
-    font-size: 14px;
-    letter-spacing: 0.04em;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    transition: 0.15s;
-  }
-  .btn-baixar:hover { filter: brightness(1.08); }
-  .btn-baixar:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-baixar .play { width: 0; height: 0; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 9px solid #0d1410; }
+    tentativas = []
+    sucesso_titulos = set()
+    erro_geral = None
+    total_erros = 0
 
-  .painel-status { margin-top: 26px; display: none; }
-  .painel-status.visivel { display: block; }
+    comando = [
+        "yt-dlp", "--ignore-errors", "--no-warnings", "--no-color",
+        "-f", "bestaudio", "-x",
+        "-o", str(pasta / "%(artist)s - %(title)s.%(ext)s"),
+        "--print", "before_dl:###INICIO###%(title)s",
+        "--print", "after_move:###FIM###%(title)s|||%(filepath)s",
+    ]
+    if formato == "WAV":
+        comando += ["--audio-format", "wav"]
+    else:
+        comando += ["--audio-format", "mp3", "--audio-quality", bitrate.replace(" kbps", "K")]
+    comando.append(url)
 
-  .resumo {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 13px;
-    padding: 10px 14px;
-    border-radius: 6px;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    margin-bottom: 14px;
-  }
-  .resumo.info { color: var(--muted); }
-  .resumo.sucesso { color: var(--accent); border-color: rgba(110,231,176,0.35); }
-  .resumo.erro { color: var(--red); border-color: rgba(255,107,107,0.3); }
+    try:
+        processo = subprocess.Popen(
+            comando, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="ignore", bufsize=1,
+        )
 
-  .lista {
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    max-height: 340px;
-    overflow-y: auto;
-  }
-  .item {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 11px 14px;
-    border-bottom: 1px solid var(--line);
-    font-size: 13.5px;
-    line-height: 1.4;
-  }
-  .item:last-child { border-bottom: none; }
-  .icone { font-family: 'JetBrains Mono', monospace; font-size: 13px; width: 16px; flex-shrink: 0; margin-top: 1px; }
-  .item.pendente .icone { color: var(--amber); }
-  .item.sucesso .icone { color: var(--accent); }
-  .item.erro .icone { color: var(--red); }
-  .item .texto strong { font-weight: 500; }
-  .item .motivo { color: var(--muted); font-size: 12px; display: block; margin-top: 2px; }
-  .item a.baixar-link {
-    margin-left: auto;
-    color: var(--accent);
-    text-decoration: none;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 11.5px;
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
+        for linha in processo.stdout:
+            linha = linha.strip()
+            if not linha:
+                continue
 
-  .acoes { display: flex; gap: 10px; margin-top: 14px; }
-  .acoes button {
-    flex: 1;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    color: var(--text);
-    border-radius: 6px;
-    padding: 11px 0;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12.5px;
-    cursor: pointer;
-  }
-  .acoes button:hover { border-color: var(--accent); }
-  .acoes button:disabled { opacity: 0.35; cursor: not-allowed; }
+            if linha.startswith("###INICIO###"):
+                titulo = linha.replace("###INICIO###", "").strip()
+                if titulo not in tentativas:
+                    tentativas.append(titulo)
+                upsert_item(job_id, titulo, "pendente")
 
-  .rodape {
-    margin-top: 30px;
-    color: #565b66;
-    font-size: 12px;
-    text-align: center;
-    line-height: 1.6;
-  }
-</style>
-</head>
-<body>
-<div class="wrap">
+            elif linha.startswith("###FIM###"):
+                resto = linha.replace("###FIM###", "").strip()
+                if "|||" in resto:
+                    titulo, caminho = resto.split("|||", 1)
+                else:
+                    titulo, caminho = resto, ""
+                titulo = titulo.strip()
+                sucesso_titulos.add(titulo)
+                upsert_item(job_id, titulo, "sucesso")
 
-  <div class="eyebrow"><span class="dot"></span>spool // downloader de áudio</div>
-  <h1>Cola o link, eu cuido do resto.</h1>
-  <div class="sub">Funciona com faixas, álbuns e playlists do SoundCloud. Faixas com DRM aparecem marcadas, não travam o resto da fila.</div>
+                nome_arquivo = os.path.basename(caminho.strip()) if caminho.strip() else None
+                if nome_arquivo:
+                    with JOBS_LOCK:
+                        JOBS[job_id]["arquivos"].append({"titulo": titulo, "arquivo": nome_arquivo})
 
-  <div class="meter" id="meter">
-    <span></span><span></span><span></span><span></span><span></span>
-    <span></span><span></span><span></span><span></span><span></span>
-    <span></span><span></span><span></span><span></span><span></span>
-    <span></span><span></span><span></span><span></span><span></span>
-  </div>
+            elif linha.startswith("ERROR:"):
+                m = REGEX_ERRO.match(linha)
+                if m:
+                    id_bruto = (m.group("id") or "Faixa").strip()
+                    msg = m.group("msg").strip()
+                else:
+                    id_bruto = "Faixa"
+                    msg = linha.replace("ERROR:", "").strip()
 
-  <div class="card">
-    <label for="url">Link</label>
-    <input type="text" id="url" placeholder="https://soundcloud.com/artista/faixa">
+                nome = mapa_titulos.get(id_bruto, id_bruto)
+                total_erros += 1
+                upsert_item(job_id, nome, "erro", msg)
 
-    <div class="row">
-      <div class="col">
-        <label>Formato</label>
-        <div class="segmented" id="segFormato">
-          <button data-valor="WAV" class="ativo">WAV</button>
-          <button data-valor="MP3">MP3</button>
-        </div>
-      </div>
-      <div class="col">
-        <label>Bitrate</label>
-        <select id="bitrate" disabled>
-          <option>128 kbps</option>
-          <option>192 kbps</option>
-          <option selected>320 kbps</option>
-        </select>
-      </div>
-    </div>
+        processo.wait()
 
-    <button class="btn-baixar" id="btnBaixar">
-      <span class="play"></span> Baixar
-    </button>
+    except FileNotFoundError:
+        erro_geral = "yt-dlp não encontrado no servidor."
+    except Exception as e:
+        erro_geral = str(e)
 
-    <div class="painel-status" id="painelStatus">
-      <div class="resumo info" id="resumo">Iniciando...</div>
-      <div class="lista" id="lista"></div>
-      <div class="acoes">
-        <button id="btnZip" disabled>Baixar tudo (.zip)</button>
-        <button id="btnCopiarErros" disabled>Copiar nomes com erro</button>
-      </div>
-    </div>
-  </div>
+    # Faixas que começaram mas nunca terminaram e não caíram em nenhum ERROR explícito
+    falhas_titulo = [t for t in tentativas if t not in sucesso_titulos]
+    for titulo in falhas_titulo:
+        with JOBS_LOCK:
+            idx = JOBS[job_id]["indice"].get(titulo)
+            ja_marcado_erro = idx is not None and JOBS[job_id]["itens"][idx]["tipo"] == "erro"
+        if not ja_marcado_erro:
+            upsert_item(job_id, titulo, "erro", "Download não concluído")
 
-  <div class="rodape">
-    Uso pessoal entre amigos. Respeite os direitos dos artistas — o que tem DRM, tem DRM por um motivo.
-  </div>
-</div>
+    with JOBS_LOCK:
+        total_falhas = sum(1 for i in JOBS[job_id]["itens"] if i["tipo"] == "erro")
+    total_sucesso = len(sucesso_titulos)
 
-<script>
-const segFormato = document.getElementById('segFormato');
-const bitrateSel = document.getElementById('bitrate');
-const btnBaixar = document.getElementById('btnBaixar');
-const urlInput = document.getElementById('url');
-const painelStatus = document.getElementById('painelStatus');
-const resumoEl = document.getElementById('resumo');
-const listaEl = document.getElementById('lista');
-const meterEl = document.getElementById('meter');
-const btnZip = document.getElementById('btnZip');
-const btnCopiarErros = document.getElementById('btnCopiarErros');
+    if erro_geral:
+        resumo, cor = f"Erro: {erro_geral}", "erro"
+    elif not tentativas and total_erros == 0:
+        resumo, cor = "Nenhuma música foi processada. Verifique o link.", "erro"
+    elif total_falhas == 0:
+        resumo, cor = f"Concluído! {total_sucesso} música(s) baixada(s) com sucesso.", "sucesso"
+    else:
+        resumo, cor = f"Concluído: {total_sucesso} com sucesso, {total_falhas} com erro.", "erro"
 
-let formatoAtual = 'WAV';
-let jobIdAtual = null;
-let pollTimer = null;
+    atualizar_job(job_id, resumo=resumo, cor=cor, finalizado=True)
 
-segFormato.querySelectorAll('button').forEach(b => {
-  b.addEventListener('click', () => {
-    segFormato.querySelectorAll('button').forEach(x => x.classList.remove('ativo'));
-    b.classList.add('ativo');
-    formatoAtual = b.dataset.valor;
-    bitrateSel.disabled = formatoAtual === 'WAV';
-  });
-});
 
-function icone(tipo) {
-  if (tipo === 'pendente') return '···';
-  if (tipo === 'sucesso') return '✔';
-  return '✖';
-}
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-function renderItens(itens, arquivos) {
-  const mapaArquivos = {};
-  arquivos.forEach(a => { mapaArquivos[a.titulo] = a.arquivo; });
 
-  listaEl.innerHTML = '';
-  itens.forEach(item => {
-    const div = document.createElement('div');
-    div.className = `item ${item.tipo}`;
+@app.route("/iniciar", methods=["POST"])
+def iniciar():
+    dados = request.get_json(force=True, silent=True) or {}
+    url = (dados.get("url") or "").strip()
+    formato = dados.get("formato", "MP3")
+    bitrate = dados.get("bitrate", "320 kbps")
 
-    const spanIcone = document.createElement('span');
-    spanIcone.className = 'icone';
-    spanIcone.textContent = icone(item.tipo);
+    if not url:
+        return jsonify({"erro": "URL vazia"}), 400
 
-    const spanTexto = document.createElement('span');
-    spanTexto.className = 'texto';
-    spanTexto.innerHTML = `<strong>${item.nome}</strong>` + (item.motivo ? `<span class="motivo">${item.motivo}</span>` : '');
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "itens": [], "indice": {}, "arquivos": [],
+            "resumo": "Iniciando...", "cor": "info", "finalizado": False,
+        }
 
-    div.appendChild(spanIcone);
-    div.appendChild(spanTexto);
+    threading.Thread(
+        target=processar_download, args=(job_id, url, formato, bitrate), daemon=True
+    ).start()
 
-    if (item.tipo === 'sucesso' && mapaArquivos[item.nome] && jobIdAtual) {
-      const link = document.createElement('a');
-      link.className = 'baixar-link';
-      link.href = `/download/${jobIdAtual}/${encodeURIComponent(mapaArquivos[item.nome])}`;
-      link.textContent = 'baixar';
-      div.appendChild(link);
-    }
+    return jsonify({"job_id": job_id})
 
-    listaEl.appendChild(div);
-  });
 
-  listaEl.scrollTop = listaEl.scrollHeight;
-}
+@app.route("/status/<job_id>")
+def status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"erro": "job não encontrado"}), 404
+        return jsonify({
+            "itens": job["itens"],
+            "resumo": job["resumo"],
+            "cor": job["cor"],
+            "finalizado": job["finalizado"],
+            "arquivos": job["arquivos"],
+        })
 
-async function poll() {
-  if (!jobIdAtual) return;
-  const resp = await fetch(`/status/${jobIdAtual}`);
-  if (!resp.ok) return;
-  const dados = await resp.json();
 
-  resumoEl.textContent = dados.resumo;
-  resumoEl.className = `resumo ${dados.cor}`;
+@app.route("/download/<job_id>/<path:nome_arquivo>")
+def download_arquivo(job_id, nome_arquivo):
+    caminho = BASE_DIR / job_id / nome_arquivo
+    if not caminho.exists():
+        abort(404)
+    return send_file(caminho, as_attachment=True)
 
-  renderItens(dados.itens, dados.arquivos);
 
-  const temErro = dados.itens.some(i => i.tipo === 'erro');
-  btnCopiarErros.disabled = !temErro;
-  btnZip.disabled = dados.arquivos.length === 0;
+@app.route("/download_zip/<job_id>")
+def download_zip(job_id):
+    pasta = BASE_DIR / job_id
+    if not pasta.exists():
+        abort(404)
+    zip_path = BASE_DIR / f"{job_id}.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for arquivo in pasta.iterdir():
+            if arquivo.is_file():
+                zf.write(arquivo, arcname=arquivo.name)
+    return send_file(zip_path, as_attachment=True, download_name="musicas.zip")
 
-  if (dados.finalizado) {
-    clearInterval(pollTimer);
-    meterEl.classList.remove('ativo');
-    btnBaixar.disabled = false;
-  }
-}
 
-btnBaixar.addEventListener('click', async () => {
-  const url = urlInput.value.trim();
-  if (!url) { urlInput.focus(); return; }
-
-  btnBaixar.disabled = true;
-  painelStatus.classList.add('visivel');
-  meterEl.classList.add('ativo');
-  resumoEl.textContent = 'Iniciando...';
-  resumoEl.className = 'resumo info';
-  listaEl.innerHTML = '';
-  btnZip.disabled = true;
-  btnCopiarErros.disabled = true;
-
-  const resp = await fetch('/iniciar', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url, formato: formatoAtual, bitrate: bitrateSel.value }),
-  });
-
-  if (!resp.ok) {
-    resumoEl.textContent = 'Não deu pra iniciar o download. Confere o link.';
-    resumoEl.className = 'resumo erro';
-    btnBaixar.disabled = false;
-    meterEl.classList.remove('ativo');
-    return;
-  }
-
-  const dados = await resp.json();
-  jobIdAtual = dados.job_id;
-
-  pollTimer = setInterval(poll, 1200);
-  poll();
-});
-
-btnZip.addEventListener('click', () => {
-  if (jobIdAtual) window.location.href = `/download_zip/${jobIdAtual}`;
-});
-
-btnCopiarErros.addEventListener('click', async () => {
-  const resp = await fetch(`/status/${jobIdAtual}`);
-  const dados = await resp.json();
-  const texto = dados.itens
-    .filter(i => i.tipo === 'erro')
-    .map(i => i.motivo ? `${i.nome} — ${i.motivo}` : i.nome)
-    .join('\n');
-  await navigator.clipboard.writeText(texto);
-  btnCopiarErros.textContent = 'Copiado!';
-  setTimeout(() => { btnCopiarErros.textContent = 'Copiar nomes com erro'; }, 1500);
-});
-</script>
-</body>
-</html>
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)
